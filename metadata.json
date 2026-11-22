@@ -1,0 +1,6 @@
+{
+  "name": "AnatomiPrompt",
+  "description": "Studio penyusun master prompt terstruktur berbasis anatomi Role, Task, Context, Reasoning, Stop conditions, dan Output.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
