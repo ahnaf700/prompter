@@ -10,7 +10,8 @@ interface AnatomyInspectorProps {
   refiningKey: AnatomyKey | null;
   refineFeedback: { key: AnatomyKey; note: string } | null;
   onUpdateSection: (key: AnatomyKey, value: string) => void;
-  onRefineSection: (key: AnatomyKey, instruction: string) => Promise<void>;
+  /** Resolves true only when the section was actually updated. */
+  onRefineSection: (key: AnatomyKey, instruction: string) => Promise<boolean>;
   onLoadBlueprint: () => void;
 }
 
@@ -35,8 +36,10 @@ export const AnatomyInspector: React.FC<AnatomyInspectorProps> = ({
 
   const handleTriggerRefine = async (key: AnatomyKey, customInstruction?: string) => {
     const instr = (customInstruction ?? refineInput).trim();
-    if (instr.length < 3) return;
-    await onRefineSection(key, instr);
+    if (instr.length < 3 || refiningKey) return; // Enter key bypasses the disabled button
+    const ok = await onRefineSection(key, instr);
+    // On failure keep the panel and the typed instruction so the user can retry without retyping.
+    if (!ok) return;
     setRefineInput('');
     setActiveRefinePanel(null);
   };
@@ -259,6 +262,8 @@ export const AnatomyInspector: React.FC<AnatomyInspectorProps> = ({
                           <input
                             type="text"
                             value={refineInput}
+                            maxLength={500}
+                            aria-label={`Arahan penyempurnaan untuk ${sec.label}`}
                             onChange={(e) => setRefineInput(e.target.value)}
                             onKeyDown={(e) => {
                               if (e.key === 'Enter') {

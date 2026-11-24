@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { AnatomyInspector } from './components/AnatomyInspector';
 import { BriefInputPanel } from './components/BriefInputPanel';
 import { CompiledPreview } from './components/CompiledPreview';
@@ -7,6 +7,8 @@ import { Header, type ActiveTab } from './components/Header';
 import { HistoryView } from './components/HistoryView';
 import { ReferenceView } from './components/ReferenceView';
 import { BLUEPRINT_REFERENCE_RESULT } from './data/presets';
+import { readApiJson } from './utils/api';
+import { HISTORY_LIMIT, parseHistory } from './utils/history';
 import type {
   AnatomyKey,
   ExportFormat,
@@ -44,16 +46,25 @@ export default function App() {
     note: string;
   } | null>(null);
 
+  // Bumped whenever the studio is reset or replaced, so a slow request can't write into a newer session.
+  const sessionRef = useRef(0);
+  const analyzeAbortRef = useRef<AbortController | null>(null);
+
   const [history, setHistory] = useState<SavedPromptItem[]>(() => {
     try {
-      const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
-      if (!raw) return [];
-      const parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
+      return parseHistory(localStorage.getItem(HISTORY_STORAGE_KEY));
     } catch {
       return [];
     }
   });
+
+  const endSession = () => {
+    sessionRef.current += 1;
+    analyzeAbortRef.current?.abort();
+    analyzeAbortRef.current = null;
+    setIsAnalyzing(false);
+    setRefiningKey(null);
+  };
 
   useEffect(() => {
     try {
@@ -65,15 +76,23 @@ export default function App() {
 
   const runAnalysis = async (
     overrideBrief?: string,
-    overrideConfig?: PromptBuildConfig
+    overrideConfig?: PromptBuildConfig,
+    overrideExtraContext?: string
   ) => {
     const targetBrief = (overrideBrief ?? briefPrompt).trim();
     const targetConfig = overrideConfig ?? config;
+    // Callers that just reset extraContext pass '' here; state would still hold the old value in this closure.
+    const targetExtra = (overrideExtraContext ?? extraContext).trim();
 
     if (targetBrief.length < 5) {
       setErrorMessage('Masukkan prompt singkat minimal 5 karakter terlebih dahulu.');
       return;
     }
+
+    endSession();
+    const session = sessionRef.current;
+    const controller = new AbortController();
+    analyzeAbortRef.current = controller;
 
     setIsAnalyzing(true);
     setErrorMessage(null);
@@ -83,9 +102,10 @@ export default function App() {
       const response = await fetch('/api/analyze-prompt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           briefPrompt: targetBrief,
-          extraContext: extraContext.trim(),
+          extraContext: targetExtra,
           outputLanguage: targetConfig.outputLanguage,
           detailLevel: targetConfig.detailLevel,
           targetStyle: targetConfig.targetStyle,
@@ -93,12 +113,11 @@ export default function App() {
         }),
       });
 
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.error || 'Gagal menganalisis prompt singkat.');
-      }
-
-      const result = data as PromptAnalysisResult;
+      const result = await readApiJson<PromptAnalysisResult>(
+        response,
+        'Gagal menganalisis prompt singkat.'
+      );
+      if (session !== sessionRef.current) return;
       setAnalysisResult(result);
 
       const newId = `prompt_${Date.now()}`;
@@ -106,47 +125,49 @@ export default function App() {
         id: newId,
         createdAt: new Date().toISOString(),
         briefPrompt: targetBrief,
-        extraContext: extraContext.trim(),
+        extraContext: targetExtra,
         config: targetConfig,
         result,
       };
       setActiveHistoryId(newId);
       setInspectorResetKey((k) => k + 1);
-      setHistory((prev) => [newEntry, ...prev].slice(0, 30));
+      setHistory((prev) => [newEntry, ...prev].slice(0, HISTORY_LIMIT));
     } catch (err) {
+      if (session !== sessionRef.current) return; // superseded or cancelled: stay silent
       setErrorMessage(
         err instanceof Error
           ? err.message
           : 'Terjadi gangguan jaringan saat menghubungi server.'
       );
     } finally {
-      setIsAnalyzing(false);
+      if (session === sessionRef.current) setIsAnalyzing(false);
     }
   };
 
   const handleUpdateSection = (key: AnatomyKey, value: string) => {
-    if (!analysisResult) return;
-    const updated: PromptAnalysisResult = {
-      ...analysisResult,
-      anatomy: {
-        ...analysisResult.anatomy,
-        [key]: value,
-      },
-    };
-    setAnalysisResult(updated);
+    // Functional updates: an async refine finishing later must not overwrite edits made while it ran.
+    setAnalysisResult((prev) =>
+      prev ? { ...prev, anatomy: { ...prev.anatomy, [key]: value } } : prev
+    );
 
     if (activeHistoryId) {
       setHistory((hist) =>
         hist.map((item) =>
-          item.id === activeHistoryId ? { ...item, result: updated } : item
+          item.id === activeHistoryId
+            ? {
+                ...item,
+                result: { ...item.result, anatomy: { ...item.result.anatomy, [key]: value } },
+              }
+            : item
         )
       );
     }
   };
 
-  const handleRefineSection = async (key: AnatomyKey, instruction: string) => {
-    if (!analysisResult) return;
+  const handleRefineSection = async (key: AnatomyKey, instruction: string): Promise<boolean> => {
+    if (!analysisResult) return false;
 
+    const session = sessionRef.current;
     setRefiningKey(key);
     setErrorMessage(null);
     setRefineFeedback(null);
@@ -165,25 +186,30 @@ export default function App() {
         }),
       });
 
-      const data = await response.json();
-      if (!response.ok) {
-        throw new Error(data?.error || 'Gagal menyempurnakan bagian prompt.');
-      }
+      const data = await readApiJson<{ updatedText: string; changeNote: string }>(
+        response,
+        'Gagal menyempurnakan bagian prompt.'
+      );
+      if (session !== sessionRef.current) return false;
 
       handleUpdateSection(key, data.updatedText);
       setRefineFeedback({ key, note: data.changeNote });
+      return true;
     } catch (err) {
+      if (session !== sessionRef.current) return false;
       setErrorMessage(
         err instanceof Error
           ? err.message
           : 'Terjadi kesalahan saat menyempurnakan bagian prompt.'
       );
+      return false;
     } finally {
-      setRefiningKey(null);
+      if (session === sessionRef.current) setRefiningKey(null);
     }
   };
 
   const handleLoadBlueprint = () => {
+    endSession();
     setBriefPrompt(BLUEPRINT_REFERENCE_RESULT.briefPrompt);
     setExtraContext('');
     setConfig(BLUEPRINT_REFERENCE_RESULT.config);
@@ -209,6 +235,7 @@ export default function App() {
     recommendedConfig: PromptBuildConfig,
     autoAnalyze: boolean
   ) => {
+    endSession();
     setBriefPrompt(brief);
     setExtraContext('');
     setConfig(recommendedConfig);
@@ -217,11 +244,12 @@ export default function App() {
     setInspectorResetKey((k) => k + 1);
     setActiveTab('studio');
     if (autoAnalyze) {
-      void runAnalysis(brief, recommendedConfig);
+      void runAnalysis(brief, recommendedConfig, '');
     }
   };
 
   const handleLoadHistoryItem = (item: SavedPromptItem) => {
+    endSession();
     setBriefPrompt(item.briefPrompt);
     setExtraContext(item.extraContext ?? '');
     setConfig({
@@ -245,6 +273,7 @@ export default function App() {
   };
 
   const handleNewPrompt = () => {
+    endSession();
     setBriefPrompt('');
     setExtraContext('');
     setAnalysisResult(null);

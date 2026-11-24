@@ -1,13 +1,23 @@
 import "dotenv/config";
-import express, { type Request, type Response } from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import path from "path";
 import { fileURLToPath } from "url";
 import { GoogleGenAI, Type } from "@google/genai";
+import {
+  UserFacingError,
+  classifyGeminiError,
+  cleanText,
+  createRateLimiter,
+  parseAnalysis,
+  parseRefinement,
+  sanitizeAnatomy,
+} from "./server/guards.ts";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
+const MODEL = process.env.GEMINI_MODEL || "gemini-4-hydrogen";
 
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -26,44 +36,6 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
-function formatGeminiError(error: unknown): { status: number; message: string } {
-  const raw = error instanceof Error ? error.message : String(error);
-  const lower = raw.toLowerCase();
-
-  if (lower.includes("gemini_api_key") || lower.includes("api_key_invalid") || lower.includes("api key")) {
-    return {
-      status: 401,
-      message:
-        "Kunci API Gemini tidak valid atau belum terpasang. Periksa konfigurasi di Settings > Secrets.",
-    };
-  }
-  if (lower.includes("permission_denied") || lower.includes("403")) {
-    return {
-      status: 403,
-      message:
-        "Akses ke model Gemini ditolak. Pastikan kunci API Anda aktif di Settings > Secrets.",
-    };
-  }
-  if (lower.includes("resource_exhausted") || lower.includes("429")) {
-    return {
-      status: 429,
-      message:
-        "Kuota permintaan API sedang penuh. Tunggu beberapa saat lalu coba analisis ulang.",
-    };
-  }
-  if (lower.includes("not_found") || lower.includes("404")) {
-    return {
-      status: 404,
-      message: "Model Gemini yang diminta tidak ditemukan atau belum tersedia.",
-    };
-  }
-
-  return {
-    status: 500,
-    message: raw || "Terjadi kesalahan saat memproses analisis prompt.",
-  };
-}
-
 const VALID_LANGUAGES = new Set(["id", "en"]);
 const VALID_DETAILS = new Set(["ringkas", "standar", "mendalam"]);
 const VALID_STYLES = new Set(["general", "claude", "gemini", "coding"]);
@@ -78,7 +50,28 @@ const VALID_SECTION_KEYS = new Set([
 ]);
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.disable("x-powered-by");
+// Behind a single reverse proxy (e.g. Cloud Run) req.ip is the proxy unless this is set, which would put every user in one rate-limit bucket.
+if (process.env.NODE_ENV === "production") app.set("trust proxy", 1);
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
+  next();
+});
+app.use(express.json({ limit: "256kb" }));
+
+// The endpoints spend the owner's Gemini quota and have no auth, so cap per-IP use.
+const allowRequest = createRateLimiter(20, 60_000);
+app.use("/api/analyze-prompt", rateLimit);
+app.use("/api/refine-section", rateLimit);
+function rateLimit(req: Request, res: Response, next: NextFunction) {
+  if (!allowRequest(req.ip ?? "unknown")) {
+    res.status(429).json({ error: "Terlalu banyak permintaan. Tunggu sebentar lalu coba lagi." });
+    return;
+  }
+  next();
+}
 
 app.get("/api/health", (_req: Request, res: Response) => {
   res.json({ ok: true });
@@ -87,8 +80,9 @@ app.get("/api/health", (_req: Request, res: Response) => {
 app.post("/api/analyze-prompt", async (req: Request, res: Response) => {
   try {
     const body = req.body ?? {};
-    const briefPrompt = typeof body.briefPrompt === "string" ? body.briefPrompt.trim() : "";
-    const extraContext = typeof body.extraContext === "string" ? body.extraContext.trim() : "";
+    const rawBrief = typeof body.briefPrompt === "string" ? body.briefPrompt.trim() : "";
+    const briefPrompt = cleanText(rawBrief, 4000);
+    const extraContext = cleanText(body.extraContext, 2000);
     const outputLanguage = VALID_LANGUAGES.has(body.outputLanguage) ? body.outputLanguage : "id";
     const detailLevel = VALID_DETAILS.has(body.detailLevel) ? body.detailLevel : "standar";
     const targetStyle = VALID_STYLES.has(body.targetStyle) ? body.targetStyle : "general";
@@ -101,7 +95,7 @@ app.post("/api/analyze-prompt", async (req: Request, res: Response) => {
       return;
     }
 
-    if (briefPrompt.length > 4000) {
+    if (rawBrief.length > 4000) {
       res.status(400).json({
         error: "Prompt singkat terlalu panjang (maksimal 4000 karakter).",
       });
@@ -161,7 +155,7 @@ Rules:
       : `Prompt singkat pengguna:\n"""${briefPrompt}"""`;
 
     const response = await ai.models.generateContent({
-      model: "gemini-4-hydrogen",
+      model: MODEL,
       contents: userMessage,
       config: {
         systemInstruction,
@@ -206,14 +200,16 @@ Rules:
 
     const rawText = (response.text ?? "").trim();
     if (!rawText) {
-      throw new Error("Model mengembalikan respons kosong. Silakan coba lagi.");
+      throw new UserFacingError("Model mengembalikan respons kosong. Silakan coba lagi.");
     }
 
-    const parsed = JSON.parse(rawText);
+    const parsed = parseAnalysis(safeJson(rawText));
+    if (!parsed) {
+      throw new UserFacingError("Model mengembalikan struktur yang tidak lengkap. Silakan coba analisis ulang.");
+    }
     res.json(parsed);
   } catch (error) {
-    const formatted = formatGeminiError(error);
-    res.status(formatted.status).json({ error: formatted.message });
+    sendError(res, error);
   }
 });
 
@@ -221,11 +217,11 @@ app.post("/api/refine-section", async (req: Request, res: Response) => {
   try {
     const body = req.body ?? {};
     const sectionKey = typeof body.sectionKey === "string" ? body.sectionKey : "";
-    const instruction = typeof body.instruction === "string" ? body.instruction.trim() : "";
-    const briefPrompt = typeof body.briefPrompt === "string" ? body.briefPrompt.trim() : "";
+    const instruction = cleanText(body.instruction, 500);
+    const briefPrompt = cleanText(body.briefPrompt, 4000);
     const outputLanguage = VALID_LANGUAGES.has(body.outputLanguage) ? body.outputLanguage : "id";
     const tone = VALID_TONES.has(body.tone) ? body.tone : "profesional";
-    const anatomy = body.anatomy && typeof body.anatomy === "object" ? body.anatomy : null;
+    const anatomy = sanitizeAnatomy(body.anatomy);
 
     if (!VALID_SECTION_KEYS.has(sectionKey)) {
       res.status(400).json({ error: "Bagian anatomi yang dipilih tidak valid." });
@@ -243,16 +239,16 @@ app.post("/api/refine-section", async (req: Request, res: Response) => {
     const ai = getGeminiClient();
 
     const response = await ai.models.generateContent({
-      model: "gemini-4-hydrogen",
+      model: MODEL,
       contents: `Prompt singkat awal: ${briefPrompt || "(tidak tersedia)"}
 
 Struktur anatomi prompt saat ini:
-- Role: ${anatomy.role ?? ""}
-- Task: ${anatomy.task ?? ""}
-- Context: ${anatomy.context ?? ""}
-- Reasoning: ${anatomy.reasoning ?? ""}
-- Stop conditions: ${anatomy.stopConditions ?? ""}
-- Output: ${anatomy.output ?? ""}
+- Role: ${anatomy.role}
+- Task: ${anatomy.task}
+- Context: ${anatomy.context}
+- Reasoning: ${anatomy.reasoning}
+- Stop conditions: ${anatomy.stopConditions}
+- Output: ${anatomy.output}
 
 Bagian yang harus disempurnakan: "${sectionKey}"
 Arahan penyempurnaan dari pengguna: "${instruction}"
@@ -281,14 +277,41 @@ Bahasa output yang harus dipertahankan: ${outputLanguage === "en" ? "English" : 
 
     const rawText = (response.text ?? "").trim();
     if (!rawText) {
-      throw new Error("Model mengembalikan respons kosong.");
+      throw new UserFacingError("Model mengembalikan respons kosong.");
     }
 
-    res.json(JSON.parse(rawText));
+    const refined = parseRefinement(safeJson(rawText));
+    if (!refined) {
+      throw new UserFacingError("Model mengembalikan penyempurnaan yang tidak lengkap. Silakan coba lagi.");
+    }
+    res.json(refined);
   } catch (error) {
-    const formatted = formatGeminiError(error);
-    res.status(formatted.status).json({ error: formatted.message });
+    sendError(res, error);
   }
+});
+
+function safeJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function sendError(res: Response, error: unknown) {
+  const formatted = classifyGeminiError(error);
+  if (formatted.status >= 500) console.error("API error:", error);
+  res.status(formatted.status).json({ error: formatted.message });
+}
+
+// Malformed or oversized JSON bodies would otherwise get Express's default HTML error page.
+app.use((err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  const status = (err as { status?: number })?.status;
+  if (status === 400 || status === 413) {
+    res.status(status).json({ error: "Permintaan tidak valid atau terlalu besar." });
+    return;
+  }
+  next(err);
 });
 
 async function startServer() {

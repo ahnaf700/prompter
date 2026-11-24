@@ -88,6 +88,7 @@ export const BriefInputPanel: React.FC<BriefInputPanelProps> = ({
         <textarea
           id="brief-textarea"
           rows={4}
+          maxLength={4000}
           value={briefPrompt}
           onChange={(e) => onChangeBrief(e.target.value)}
           onKeyDown={handleKeyDown}
@@ -115,6 +116,8 @@ export const BriefInputPanel: React.FC<BriefInputPanelProps> = ({
           <div className="mt-3">
             <textarea
               rows={2}
+              maxLength={2000}
+              aria-label="Fakta atau batasan tambahan"
               value={extraContext}
               onChange={(e) => onChangeExtraContext(e.target.value)}
               placeholder="Misal: Target audiens UMKM kuliner, deadline 2 minggu, format akhir harus siap presentasi ke investor..."
